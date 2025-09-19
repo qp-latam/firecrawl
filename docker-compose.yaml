@@ -3,7 +3,7 @@ name: firecrawl
 x-common-service: &common-service
   # NOTE: If you don't want to build the service locally,
   # uncomment the build: statement and comment out the image: statement
-  image: ghcr.io/firecrawl/firecrawl
+  image: ghcr.io/firecrawl/firecrawl:latest
   # build: apps/api
 
   ulimits:
