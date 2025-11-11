@@ -25,6 +25,7 @@ import { BLOCKLISTED_URL_MESSAGE } from "../../lib/strings";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
 import { fromV1ScrapeOptions } from "../v2/types";
 import { checkPermissions } from "../../lib/permissions";
+import { crawlGroup } from "../../services/worker/nuq";
 
 export async function batchScrapeController(
   req: RequestWithAuth<{}, BatchScrapeResponse, BatchScrapeRequest>,
@@ -136,6 +137,11 @@ export async function batchScrapeController(
       };
 
   if (!req.body.appendToId) {
+    await crawlGroup.addGroup(
+      id,
+      sc.team_id,
+      (req.acuc?.flags?.crawlTtlHours ?? 24) * 60 * 60 * 1000,
+    );
     await saveCrawl(id, sc);
     await markCrawlActive(id);
   }
@@ -205,7 +211,7 @@ export async function batchScrapeController(
     await sender?.send(WebhookEvent.BATCH_SCRAPE_STARTED, { success: true });
   }
 
-  const protocol = process.env.ENV === "local" ? req.protocol : "https";
+  const protocol = req.protocol;
 
   return res.status(200).json({
     success: true,

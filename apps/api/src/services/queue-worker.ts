@@ -20,6 +20,10 @@ import Express from "express";
 import { robustFetch } from "../scraper/scrapeURL/lib/fetch";
 import { BullMQOtel } from "bullmq-otel";
 import { initializeBlocklist } from "../scraper/WebScraper/utils/blocklist";
+import { initializeEngineForcing } from "../scraper/WebScraper/utils/engine-forcing";
+import { crawlFinishedQueue, NuQJob, scrapeQueue } from "./worker/nuq";
+import { finishCrawlSuper } from "./worker/crawl-logic";
+import { getCrawl } from "../lib/crawl-redis";
 
 configDotenv();
 
@@ -191,16 +195,46 @@ const processGenerateLlmsTxtJobInternal = async (
   }
 };
 
+async function processFinishCrawlJobInternal(_job: NuQJob) {
+  const job = await crawlFinishedQueue.getJob(_job.id);
+
+  if (!job) {
+    throw new Error("crawlFinish job disappeared");
+  }
+
+  if (!job.groupId) {
+    throw new Error("crawlFinish job with no groupId");
+  }
+
+  if (!job.ownerId) {
+    throw new Error("crawlFinish job with no ownerId");
+  }
+
+  const sc = await getCrawl(job.groupId);
+
+  if (!sc) {
+    throw new Error("crawlFinish job with sc expired");
+  }
+
+  const anyJob = await scrapeQueue.getGroupAnyJob(job.groupId, job.ownerId);
+
+  if (!anyJob) {
+    throw new Error("crawlFinish couldn't find anyJob");
+  }
+
+  await finishCrawlSuper(anyJob);
+}
+
 let isShuttingDown = false;
 let isWorkerStalled = false;
 
 process.on("SIGINT", () => {
-  console.log("Received SIGTERM. Shutting down gracefully...");
+  _logger.debug("Received SIGINT. Shutting down gracefully...");
   isShuttingDown = true;
 });
 
 process.on("SIGTERM", () => {
-  console.log("Received SIGTERM. Shutting down gracefully...");
+  _logger.debug("Received SIGTERM. Shutting down gracefully...");
   isShuttingDown = true;
 });
 
@@ -226,7 +260,7 @@ const workerFun = async (
 
   while (true) {
     if (isShuttingDown) {
-      console.log("No longer accepting new jobs. SIGINT");
+      _logger.info("No longer accepting new jobs. SIGINT");
       break;
     }
     const token = uuidv4();
@@ -271,6 +305,93 @@ const workerFun = async (
       await sleep(gotJobInterval);
     } else {
       await sleep(connectionMonitorInterval);
+    }
+  }
+};
+
+const crawlFinishWorker = async () => {
+  const __logger = _logger.child({
+    module: "extract-worker",
+    method: "crawlFinishWorker",
+  });
+
+  let noJobTimeout = 1500;
+
+  while (!isShuttingDown) {
+    const job = await crawlFinishedQueue.getJobToProcess();
+
+    if (job === null) {
+      __logger.info("No jobs to process", { module: "nuq/metrics" });
+      await new Promise(resolve => setTimeout(resolve, noJobTimeout));
+      if (!process.env.NUQ_RABBITMQ_URL) {
+        noJobTimeout = Math.min(noJobTimeout * 2, 10000);
+      }
+      continue;
+    }
+
+    noJobTimeout = 500;
+
+    const logger = __logger.child({
+      zeroDataRetention: job.data?.zeroDataRetention ?? false,
+      crawlId: job.groupId,
+    });
+
+    logger.info("Acquired job");
+
+    const lockRenewInterval = setInterval(async () => {
+      logger.info("Renewing lock");
+      if (!(await crawlFinishedQueue.renewLock(job.id, job.lock!, logger))) {
+        logger.warn("Failed to renew lock");
+        clearInterval(lockRenewInterval);
+        return;
+      }
+      logger.info("Renewed lock");
+    }, 15000);
+
+    let processResult:
+      | {
+          ok: true;
+          data: Awaited<ReturnType<typeof processFinishCrawlJobInternal>>;
+        }
+      | { ok: false; error: any };
+
+    try {
+      processResult = {
+        ok: true,
+        data: await processFinishCrawlJobInternal(job),
+      };
+    } catch (error) {
+      processResult = { ok: false, error };
+    }
+
+    clearInterval(lockRenewInterval);
+
+    if (processResult.ok) {
+      if (
+        !(await crawlFinishedQueue.jobFinish(
+          job.id,
+          job.lock!,
+          processResult.data,
+          logger,
+        ))
+      ) {
+        logger.warn("Could not update job status");
+      }
+    } else {
+      if (
+        !(await crawlFinishedQueue.jobFail(
+          job.id,
+          job.lock!,
+          processResult.error instanceof Error
+            ? processResult.error.message
+            : typeof processResult.error === "string"
+              ? processResult.error
+              : JSON.stringify(processResult.error),
+          logger,
+        ))
+      ) {
+        logger.warn("Could not update job status");
+      }
     }
   }
 };
@@ -323,18 +444,23 @@ app.listen(workerPort, () => {
     process.exit(1);
   });
 
+  initializeEngineForcing();
+
   await Promise.all([
     workerFun(getDeepResearchQueue(), processDeepResearchJobInternal),
     workerFun(getGenerateLlmsTxtQueue(), processGenerateLlmsTxtJobInternal),
+    crawlFinishWorker(),
   ]);
 
-  console.log("All workers exited. Waiting for all jobs to finish...");
+  _logger.info("All workers exited. Waiting for all jobs to finish...");
 
   while (runningJobs.size > 0) {
     await new Promise(resolve => setTimeout(resolve, 500));
   }
 
-  console.log("All jobs finished. Worker out!");
-  await shutdownOtel();
-  process.exit(0);
+  _logger.info("All jobs finished. Shutting down...");
+  shutdownOtel().finally(() => {
+    _logger.debug("OTEL shutdown");
+    process.exit(0);
+  });
 })();

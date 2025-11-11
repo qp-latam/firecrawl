@@ -16,6 +16,7 @@ import {
   addCrawlJobs,
   addCrawlJobDone,
   crawlToCrawler,
+  recordRobotsBlocked,
   finishCrawlKickoff,
   generateURLPermutations,
   getCrawl,
@@ -36,7 +37,7 @@ import { getJobPriority } from "../../lib/job-priority";
 import { Document, scrapeOptions, TeamFlags } from "../../controllers/v2/types";
 import { hasFormatOfType } from "../../lib/format-utils";
 import { getACUCTeam } from "../../controllers/auth";
-import { createWebhookSender, WebhookEvent } from "../webhook";
+import { createWebhookSender, WebhookEvent } from "../webhook/index";
 import { CustomError } from "../../lib/custom-error";
 import { startWebScraperPipeline } from "../../main/runWebScraper";
 import { CostTracking } from "../../lib/cost-tracking";
@@ -49,7 +50,6 @@ import { WebCrawler } from "../../scraper/WebScraper/crawler";
 import { calculateCreditsToBeBilled } from "../../lib/scrape-billing";
 import { getBillingQueue } from "../queue-service";
 import type { Logger } from "winston";
-import { finishCrawlIfNeeded } from "./crawl-logic";
 import {
   RacedRedirectError,
   ScrapeJobTimeoutError,
@@ -337,14 +337,7 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
           // Store robots blocked URLs in Redis set
           for (const [url, reason] of links.denialReasons) {
             if (reason === "URL blocked by robots.txt") {
-              await redisEvictConnection.sadd(
-                "crawl:" + job.data.crawl_id + ":robots_blocked",
-                url,
-              );
-              await redisEvictConnection.expire(
-                "crawl:" + job.data.crawl_id + ":robots_blocked",
-                24 * 60 * 60,
-              );
+              await recordRobotsBlocked(job.data.crawl_id, url);
             }
           }
 
@@ -497,8 +490,6 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
 
       logger.debug("Declaring job as done...");
       await addCrawlJobDone(job.data.crawl_id, job.id, true, logger);
-
-      await finishCrawlIfNeeded(job, sc);
     } else {
       try {
         signal?.throwIfAborted();
@@ -547,6 +538,20 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
     logger.info(`🐂 Job done ${job.id}`);
     return data;
   } catch (error) {
+    // Record top-level robots.txt rejections so crawl status can warn
+    try {
+      if (
+        job.data.crawl_id &&
+        job.data.crawlerOptions !== null &&
+        error instanceof Error &&
+        error.message === "URL blocked by robots.txt"
+      ) {
+        await recordRobotsBlocked(job.data.crawl_id, job.data.url);
+      }
+    } catch (e) {
+      logger.debug("Failed to record top-level robots block", { e });
+    }
+
     if (job.data.crawl_id) {
       const sc = (await getCrawl(job.data.crawl_id)) as StoredCrawl;
 
@@ -561,8 +566,6 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
         "crawl:" + job.data.crawl_id + ":jobs_qualified",
         job.id,
       );
-
-      await finishCrawlIfNeeded(job, sc);
     }
 
     const isEarlyTimeout = error instanceof ScrapeJobTimeoutError;
@@ -929,16 +932,12 @@ async function processKickoffJob(job: NuQJob<ScrapeJobKickoff>) {
     logger.debug("Done queueing jobs!");
 
     await finishCrawlKickoff(job.data.crawl_id);
-    await finishCrawlIfNeeded(job, sc);
 
     return { success: true };
   } catch (error) {
     logger.error("An error occurred!", { error });
     await finishCrawlKickoff(job.data.crawl_id);
     const sc = (await getCrawl(job.data.crawl_id)) as StoredCrawl;
-    if (sc) {
-      await finishCrawlIfNeeded(job, sc);
-    }
     return { success: false, error };
   }
 }
@@ -974,6 +973,7 @@ async function processKickoffSitemapJob(job: NuQJob<ScrapeJobKickoffSitemap>) {
       location: job.data.location,
       crawlId: job.data.crawl_id,
       logger,
+      isPreCrawl: sc.internalOptions?.isPreCrawl ?? false,
     });
 
     const passingURLs = (
@@ -1057,10 +1057,6 @@ async function processKickoffSitemapJob(job: NuQJob<ScrapeJobKickoffSitemap>) {
       "crawl:" + job.data.crawl_id + ":sitemap_jobs_done",
       24 * 60 * 60,
     );
-
-    if (sc) {
-      await finishCrawlIfNeeded(job, sc);
-    }
   }
 }
 
@@ -1167,7 +1163,7 @@ async function processJobWithTracing(job: NuQJob<ScrapeJobData>, logger: any) {
       await concurrentJobDone(job);
     }
   } catch (error) {
-    logger.debug("Job failed", { error });
+    logger.warn("Job failed", { error });
     Sentry.captureException(error);
     if (error instanceof TransportableError) {
       throw new Error(serializeTransportableError(error));

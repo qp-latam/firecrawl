@@ -2,10 +2,7 @@ import "dotenv/config";
 import { shutdownOtel } from "../otel";
 import "./sentry";
 import * as Sentry from "@sentry/node";
-import {
-  getExtractQueue,
-  getRedisConnection,
-} from "./queue-service";
+import { getExtractQueue, getRedisConnection } from "./queue-service";
 import { Job, Queue, Worker } from "bullmq";
 import { logger as _logger } from "../lib/logger";
 import systemMonitor from "./system-monitor";
@@ -23,6 +20,7 @@ import { robustFetch } from "../scraper/scrapeURL/lib/fetch";
 import { BullMQOtel } from "bullmq-otel";
 import { getErrorContactMessage } from "../lib/deployment";
 import { initializeBlocklist } from "../scraper/WebScraper/utils/blocklist";
+import { initializeEngineForcing } from "../scraper/WebScraper/utils/engine-forcing";
 
 configDotenv();
 
@@ -172,12 +170,12 @@ let isShuttingDown = false;
 let isWorkerStalled = false;
 
 process.on("SIGINT", () => {
-  console.log("Received SIGTERM. Shutting down gracefully...");
+  _logger.debug("Received SIGINT. Shutting down gracefully...");
   isShuttingDown = true;
 });
 
 process.on("SIGTERM", () => {
-  console.log("Received SIGTERM. Shutting down gracefully...");
+  _logger.debug("Received SIGTERM. Shutting down gracefully...");
   isShuttingDown = true;
 });
 
@@ -203,7 +201,7 @@ const workerFun = async (
 
   while (true) {
     if (isShuttingDown) {
-      console.log("No longer accepting new jobs. SIGINT");
+      _logger.info("No longer accepting new jobs. SIGINT");
       break;
     }
     const token = uuidv4();
@@ -300,17 +298,19 @@ app.listen(workerPort, () => {
     process.exit(1);
   });
 
-  await Promise.all([
-    workerFun(getExtractQueue(), processExtractJobInternal),
-  ]);
+  initializeEngineForcing();
 
-  console.log("All workers exited. Waiting for all jobs to finish...");
+  await Promise.all([workerFun(getExtractQueue(), processExtractJobInternal)]);
+
+  _logger.info("All workers exited. Waiting for all jobs to finish...");
 
   while (runningJobs.size > 0) {
     await new Promise(resolve => setTimeout(resolve, 500));
   }
 
-  console.log("All jobs finished. Worker out!");
-  await shutdownOtel();
-  process.exit(0);
+  _logger.info("All jobs finished. Shutting down...");
+  shutdownOtel().finally(() => {
+    _logger.debug("OTEL shutdown");
+    process.exit(0);
+  });
 })();

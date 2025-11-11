@@ -20,6 +20,7 @@ import Ajv from "ajv";
 import { integrationSchema } from "../../utils/integration";
 import { webhookSchema } from "../../services/webhook/schema";
 import { modifyCrawlUrl } from "../../utils/url-utils";
+import { BrandingProfile } from "../../types/branding";
 
 // Base URL schema with common validation logic
 const BASE_URL_SCHEMA = z.preprocess(
@@ -44,13 +45,23 @@ const BASE_URL_SCHEMA = z.preprocess(
     .string()
     .url()
     .regex(/^https?:\/\//i, "URL uses unsupported protocol")
-    .refine(
-      x =>
-        /(\.[a-zA-Z0-9-\u0400-\u04FF\u0500-\u052F\u2DE0-\u2DFF\uA640-\uA69F]{2,}|\.xn--[a-zA-Z0-9-]{1,})(:\d+)?([\/?#]|$)/i.test(
-          x,
-        ),
-      "URL must have a valid top-level domain or be a valid path",
-    )
+    .refine(x => {
+      if (
+        process.env.TEST_SUITE_SELF_HOSTED === "true" &&
+        process.env.ALLOW_LOCAL_WEBHOOKS === "true"
+      ) {
+        if (
+          /^https?:\/\/(localhost|127\.0\.0\.1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(:\d+)?([\/?#]|$)/i.test(
+            x as string,
+          )
+        ) {
+          return true;
+        }
+      }
+      return /(\.[a-zA-Z0-9-\u0400-\u04FF\u0500-\u052F\u2DE0-\u2DFF\uA640-\uA69F]{2,}|\.xn--[a-zA-Z0-9-]{1,})(:\d+)?([\/?#]|$)/i.test(
+        x,
+      );
+    }, "URL must have a valid top-level domain or be a valid path")
     .refine(x => {
       try {
         checkUrl(x as string);
@@ -110,7 +121,14 @@ function normalizeSchemaForOpenAI(schema: any): any {
         }
       }
 
-      return { ...processedRest, $defs };
+      const normalizedDefs = Object.fromEntries(
+        Object.entries($defs ?? {}).map(([key, value]) => [
+          key,
+          normalizeObject(value),
+        ]),
+      );
+
+      return { ...processedRest, $defs: normalizedDefs };
     }
 
     if (
@@ -392,7 +410,8 @@ export type FormatObject =
   | JsonFormatWithOptions
   | ChangeTrackingFormatWithOptions
   | ScreenshotFormatWithOptions
-  | AttributesFormatWithOptions;
+  | AttributesFormatWithOptions
+  | { type: "branding" };
 
 const pdfParserWithOptions = z
   .object({
@@ -486,6 +505,7 @@ const baseScrapeOptions = z
             changeTrackingFormatWithOptions,
             screenshotFormatWithOptions,
             attributesFormatWithOptions,
+            z.object({ type: z.literal("branding") }),
           ])
           .array()
           .optional()
@@ -840,6 +860,7 @@ export type Document = {
   extract?: any;
   json?: any;
   summary?: string;
+  branding?: BrandingProfile;
   warning?: string;
   attributes?: {
     selector: string;
@@ -1331,6 +1352,8 @@ export function fromV1ScrapeOptions(
             return fmt;
           } else if (x === "screenshot@fullPage") {
             return { type: "screenshot" as const, fullPage: true };
+          } else if (x === "branding") {
+            return { type: "branding" as const };
           } else {
             return x;
           }
@@ -1453,11 +1476,17 @@ export const searchRequestSchema = z
         // Array of strings (simple format)
         z.array(z.enum(["github", "research", "pdf"])),
         // Array of objects (advanced format)
-        z.array(z.union([githubCategoryOptions, researchCategoryOptions, pdfCategoryOptions])),
+        z.array(
+          z.union([
+            githubCategoryOptions,
+            researchCategoryOptions,
+            pdfCategoryOptions,
+          ]),
+        ),
       ])
       .optional(),
     lang: z.string().optional().default("en"),
-    country: z.string().optional().default("us"),
+    country: z.string().optional(),
     location: z.string().optional(),
     origin: z.string().optional().default("api"),
     integration: integrationSchema.optional().transform(val => val || null),
@@ -1504,6 +1533,9 @@ export const searchRequestSchema = z
   )
   .refine(x => waitForRefine(x.scrapeOptions), waitForRefineOpts)
   .transform(x => {
+    const country =
+      x.country !== undefined ? x.country : x.location ? undefined : "us";
+
     // Transform string array sources to object format
     let sources = x.sources;
     if (sources && Array.isArray(sources) && sources.length > 0) {
@@ -1518,7 +1550,7 @@ export const searchRequestSchema = z
                 tbs: x.tbs,
                 filter: x.filter,
                 lang: x.lang,
-                country: x.country,
+                country,
                 location: x.location,
               };
             case "images":
@@ -1531,7 +1563,7 @@ export const searchRequestSchema = z
                 type: "news" as const,
                 tbs: x.tbs,
                 lang: x.lang,
-                country: x.country,
+                country,
                 location: x.location,
               };
             default:
@@ -1572,6 +1604,7 @@ export const searchRequestSchema = z
 
     return {
       ...x,
+      country,
       sources,
       categories,
       scrapeOptions: extractTransform(x.scrapeOptions),

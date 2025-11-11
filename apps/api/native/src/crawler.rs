@@ -120,6 +120,7 @@ const FILE_TYPE: &str = "FILE_TYPE";
 const SOCIAL_MEDIA: &str = "SOCIAL_MEDIA";
 const EXTERNAL_LINK: &str = "EXTERNAL_LINK";
 const SECTION_LINK: &str = "SECTION_LINK";
+const NON_WEB_PROTOCOL: &str = "NON_WEB_PROTOCOL";
 
 #[inline]
 fn is_file(path: &str) -> bool {
@@ -170,6 +171,23 @@ fn no_sections(url_str: &str) -> bool {
 }
 
 #[inline]
+fn is_non_web_protocol(url_str: &str) -> bool {
+  const NON_WEB_PROTOCOLS: &[&str] = &[
+    "mailto:",
+    "tel:",
+    "telnet:",
+    "ftp:",
+    "ftps:",
+    "ssh:",
+    "file:",
+  ];
+
+  NON_WEB_PROTOCOLS
+    .iter()
+    .any(|protocol| url_str.starts_with(protocol))
+}
+
+#[inline]
 fn is_social_media_or_email(url_str: &str) -> bool {
   const SOCIAL_MEDIA_OR_EMAIL: &[&str] = &[
     "facebook.com",
@@ -177,7 +195,6 @@ fn is_social_media_or_email(url_str: &str) -> bool {
     "linkedin.com",
     "instagram.com",
     "pinterest.com",
-    "mailto:",
     "github.com",
     "calendly.com",
     "discord.gg",
@@ -267,6 +284,11 @@ fn _filter_links(data: FilterLinksCall) -> std::result::Result<FilterLinksResult
     let path = url.path();
     let url_str = url.as_str();
 
+    if is_non_web_protocol(url_str) {
+      denial_reasons.insert(link, NON_WEB_PROTOCOL.to_string());
+      continue;
+    }
+
     if get_url_depth(path) > data.max_depth {
       denial_reasons.insert(link, DEPTH_LIMIT.to_string());
       continue;
@@ -337,6 +359,14 @@ fn _filter_links(data: FilterLinksCall) -> std::result::Result<FilterLinksResult
         && !is_social_media_or_email(url_str)
         && is_subdomain(&url, &base_url)
       {
+        // When allowing subdomains, still honor include patterns
+        let match_target = if data.regex_on_full_url { url_str } else { path };
+        if !includes_regex.is_empty()
+          && !includes_regex.iter().any(|r| r.is_match(match_target))
+        {
+          denial_reasons.insert(link, INCLUDE_PATTERN.to_string());
+          continue;
+        }
         result_links.push(link);
         continue;
       }
@@ -408,6 +438,14 @@ fn _filter_url(data: FilterUrlCall) -> std::result::Result<FilterUrlResult, Stri
 
   let path = url.path();
   let url_str = url.as_str();
+
+  if is_non_web_protocol(url_str) {
+    return Ok(FilterUrlResult {
+      allowed: false,
+      url: None,
+      denial_reason: Some(NON_WEB_PROTOCOL.to_string()),
+    });
+  }
 
   let excludes_regex: Vec<Regex> = data
     .excludes
@@ -928,6 +966,55 @@ mod tests {
     let result = result.unwrap();
     assert_eq!(result.links.len(), 1);
     assert_eq!(result.links[0], "https://example.com/test");
+  }
+
+  #[test]
+  fn test_filter_links_allow_subdomains_with_include_paths() {
+    let data = FilterLinksCall {
+      links: vec![
+        "https://sub.example.com/pricing".to_string(),
+        "https://sub.example.com/blog".to_string(),
+        "https://other.example.com/pricing".to_string(),
+        "https://example.com/pricing".to_string(),
+      ],
+      limit: Some(10),
+      includes: vec!["^/pricing$".to_string()],
+      excludes: vec![],
+      ignore_robots_txt: true,
+      robots_txt: "".to_string(),
+      max_depth: 10,
+      base_url: "https://example.com".to_string(),
+      initial_url: "https://example.com".to_string(),
+      regex_on_full_url: false,
+      allow_backward_crawling: true,
+      allow_external_content_links: false,
+      allow_subdomains: true,
+    };
+
+    let result = _filter_links(data).unwrap();
+    // Should include only paths matching include on base or subdomains
+    assert_eq!(result.links.len(), 3);
+    assert!(result
+      .links
+      .contains(&"https://example.com/pricing".to_string()));
+    assert!(result
+      .links
+      .contains(&"https://sub.example.com/pricing".to_string()));
+    assert!(result
+      .links
+      .contains(&"https://other.example.com/pricing".to_string()));
+    // And should exclude blog due to includePaths
+    assert!(result
+      .denial_reasons
+      .get("https://sub.example.com/blog")
+      .is_some());
+    assert_eq!(
+      result
+        .denial_reasons
+        .get("https://sub.example.com/blog")
+        .unwrap(),
+      "INCLUDE_PATTERN"
+    );
   }
 
   #[test]

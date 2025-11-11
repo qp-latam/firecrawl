@@ -14,6 +14,7 @@ import Ajv from "ajv";
 import { ErrorCodes } from "../../lib/error";
 import { integrationSchema } from "../../utils/integration";
 import { webhookSchema } from "../../services/webhook/schema";
+import { BrandingProfile } from "../../types/branding";
 
 type Format =
   | "markdown"
@@ -25,7 +26,8 @@ type Format =
   | "extract"
   | "json"
   | "summary"
-  | "changeTracking";
+  | "changeTracking"
+  | "branding";
 
 export const url = z.preprocess(
   x => {
@@ -49,13 +51,23 @@ export const url = z.preprocess(
     .string()
     .url()
     .regex(/^https?:\/\//i, "URL uses unsupported protocol")
-    .refine(
-      x =>
-        /(\.[a-zA-Z0-9-\u0400-\u04FF\u0500-\u052F\u2DE0-\u2DFF\uA640-\uA69F]{2,}|\.xn--[a-zA-Z0-9-]{1,})(:\d+)?([\/?#]|$)/i.test(
-          x,
-        ),
-      "URL must have a valid top-level domain or be a valid path",
-    )
+    .refine(x => {
+      if (
+        process.env.TEST_SUITE_SELF_HOSTED === "true" &&
+        process.env.ALLOW_LOCAL_WEBHOOKS === "true"
+      ) {
+        if (
+          /^https?:\/\/(localhost|127\.0\.0\.1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(:\d+)?([\/?#]|$)/i.test(
+            x as string,
+          )
+        ) {
+          return true;
+        }
+      }
+      return /(\.[a-zA-Z0-9-\u0400-\u04FF\u0500-\u052F\u2DE0-\u2DFF\uA640-\uA69F]{2,}|\.xn--[a-zA-Z0-9-]{1,})(:\d+)?([\/?#]|$)/i.test(
+        x,
+      );
+    }, "URL must have a valid top-level domain or be a valid path")
     .refine(x => {
       try {
         checkUrl(x as string);
@@ -413,6 +425,7 @@ const baseScrapeOptions = z
         "json",
         "summary",
         "changeTracking",
+        "branding",
       ])
       .array()
       .optional()
@@ -507,7 +520,12 @@ const baseScrapeOptions = z
     useMock: z.string().optional(),
     blockAds: z.boolean().default(true),
     proxy: z.enum(["basic", "stealth", "auto"]).default("basic"),
-    maxAge: z.number().int().gte(0).safe().default(0),
+    maxAge: z
+      .number()
+      .int()
+      .gte(0)
+      .safe()
+      .default(1 * 24 * 60 * 60 * 1000),
     storeInCache: z.boolean().default(true),
     // @deprecated
     __experimental_cache: z.boolean().default(false).optional(),
@@ -939,6 +957,7 @@ export type Document = {
   extract?: any;
   json?: any;
   summary?: string;
+  branding?: BrandingProfile;
   warning?: string;
   actions?: {
     screenshots?: string[];
@@ -1216,6 +1235,7 @@ export type TeamFlags = {
   allowTeammateInvites?: boolean;
   crawlTtlHours?: number;
   ipWhitelist?: boolean;
+  skipCountryCheck?: boolean;
 } | null;
 
 export type AuthCreditUsageChunkFromTeam = Omit<
@@ -1446,7 +1466,7 @@ export const searchRequestSchema = z
     tbs: z.string().optional(),
     filter: z.string().optional(),
     lang: z.string().optional().default("en"),
-    country: z.string().optional().default("us"),
+    country: z.string().optional(),
     location: z.string().optional(),
     origin: z.string().optional().default("api"),
     integration: integrationSchema.optional().transform(val => val || null),
@@ -1480,6 +1500,8 @@ export const searchRequestSchema = z
   .refine(x => waitForRefine(x.scrapeOptions), waitForRefineOpts)
   .transform(x => ({
     ...x,
+    country:
+      x.country !== undefined ? x.country : x.location ? undefined : "us",
     scrapeOptions: extractTransform(x.scrapeOptions),
   }));
 

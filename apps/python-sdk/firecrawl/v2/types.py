@@ -124,6 +124,24 @@ class AttributeResult(BaseModel):
     attribute: str
     values: List[str]
 
+class BrandingProfile(BaseModel):
+    """Branding information extracted from a website."""
+    model_config = {"extra": "allow"}
+    
+    color_scheme: Optional[Literal["light", "dark"]] = None
+    logo: Optional[str] = None
+    fonts: Optional[List[Dict[str, Any]]] = None
+    colors: Optional[Dict[str, str]] = None
+    typography: Optional[Dict[str, Any]] = None
+    spacing: Optional[Dict[str, Any]] = None
+    components: Optional[Dict[str, Any]] = None
+    icons: Optional[Dict[str, str]] = None
+    images: Optional[Dict[str, Optional[str]]] = None
+    animations: Optional[Dict[str, str]] = None
+    layout: Optional[Dict[str, Any]] = None
+    tone: Optional[Dict[str, str]] = None
+    personality: Optional[Dict[str, Any]] = None
+
 class Document(BaseModel):
     """A scraped document."""
     markdown: Optional[str] = None
@@ -138,6 +156,7 @@ class Document(BaseModel):
     actions: Optional[Dict[str, Any]] = None
     warning: Optional[str] = None
     change_tracking: Optional[Dict[str, Any]] = None
+    branding: Optional[BrandingProfile] = None
 
     @property
     def metadata_typed(self) -> DocumentMetadata:
@@ -199,7 +218,7 @@ CategoryOption = Union[str, Category]
 
 FormatString = Literal[
     # camelCase versions (API format)
-    "markdown", "html", "rawHtml", "links",  "images", "screenshot", "summary", "changeTracking", "json", "attributes",
+    "markdown", "html", "rawHtml", "links",  "images", "screenshot", "summary", "changeTracking", "json", "attributes", "branding",
     # snake_case versions (user-friendly)
     "raw_html", "change_tracking"
 ]
@@ -768,7 +787,7 @@ class ActiveCrawlsRequest(BaseModel):
 # Configuration types
 class ClientConfig(BaseModel):
     """Configuration for the Firecrawl client."""
-    api_key: str
+    api_key: Optional[str] = None
     api_url: str = "https://api.firecrawl.dev"
     timeout: Optional[float] = None
     max_retries: int = 3

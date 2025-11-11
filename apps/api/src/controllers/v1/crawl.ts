@@ -17,6 +17,7 @@ import { _addScrapeJobToBullMQ } from "../../services/queue-jobs";
 import { logger as _logger } from "../../lib/logger";
 import { fromV1ScrapeOptions } from "../v2/types";
 import { checkPermissions } from "../../lib/permissions";
+import { crawlGroup } from "../../services/worker/nuq";
 
 export async function crawlController(
   req: RequestWithAuth<{}, CrawlResponse, CrawlRequest>,
@@ -135,6 +136,12 @@ export async function crawlController(
     });
   }
 
+  await crawlGroup.addGroup(
+    id,
+    sc.team_id,
+    (req.acuc?.flags?.crawlTtlHours ?? 24) * 60 * 60 * 1000,
+  );
+
   await saveCrawl(id, sc);
 
   await markCrawlActive(id);
@@ -158,7 +165,7 @@ export async function crawlController(
     crypto.randomUUID(),
   );
 
-  const protocol = process.env.ENV === "local" ? req.protocol : "https";
+  const protocol = req.protocol;
 
   return res.status(200).json({
     success: true,

@@ -27,6 +27,7 @@ import {
   EngineError,
   NoEnginesLeftError,
   PDFAntibotError,
+  DocumentAntibotError,
   RemoveFeatureError,
   SiteError,
   UnsupportedFileError,
@@ -36,6 +37,7 @@ import {
   DNSResolutionError,
   ZDRViolationError,
   PDFPrefetchFailed,
+  DocumentPrefetchFailed,
   FEPageLoadFailed,
   EngineSnipedError,
   WaterfallNextEngineSignal,
@@ -47,6 +49,7 @@ import { LLMRefusalError } from "./transformers/llmExtract";
 import { urlSpecificParams } from "./lib/urlSpecificParams";
 import { loadMock, MockState } from "./lib/mock";
 import { CostTracking } from "../../lib/cost-tracking";
+import { getEngineForUrl } from "../WebScraper/utils/engine-forcing";
 import {
   addIndexRFInsertJob,
   generateDomainSplits,
@@ -95,6 +98,17 @@ export type Meta = {
         url?: string;
         status: number;
         proxyUsed: "basic" | "stealth";
+        contentType?: string;
+      }
+    | null
+    | undefined; // undefined: no prefetch yet, null: prefetch came back empty
+  documentPrefetch:
+    | {
+        filePath: string;
+        url?: string;
+        status: number;
+        proxyUsed: "basic" | "stealth";
+        contentType?: string;
       }
     | null
     | undefined; // undefined: no prefetch yet, null: prefetch came back empty
@@ -119,6 +133,10 @@ function buildFeatureFlags(
     } else {
       flags.add("screenshot");
     }
+  }
+
+  if (hasFormatOfType(options.formats, "branding")) {
+    flags.add("branding");
   }
 
   if (options.waitFor !== 0) {
@@ -152,16 +170,24 @@ function buildFeatureFlags(
   const urlO = new URL(url);
   const lowerPath = urlO.pathname.toLowerCase();
 
-  if (lowerPath.endsWith(".pdf")) {
-    flags.add("pdf");
-  }
-
-  if (
+  // Check for document types first (they take precedence over PDF)
+  const isDocument =
     lowerPath.endsWith(".docx") ||
     lowerPath.endsWith(".odt") ||
-    lowerPath.endsWith(".rtf")
-  ) {
+    lowerPath.endsWith(".rtf") ||
+    lowerPath.endsWith(".xlsx") ||
+    lowerPath.endsWith(".xls") ||
+    lowerPath.includes(".docx/") ||
+    lowerPath.includes(".odt/") ||
+    lowerPath.includes(".rtf/") ||
+    lowerPath.includes(".xlsx/") ||
+    lowerPath.includes(".xls/");
+
+  if (isDocument) {
     flags.add("document");
+  } else if (lowerPath.endsWith(".pdf") || lowerPath.includes(".pdf/")) {
+    // Only add PDF flag if it's not a document
+    flags.add("pdf");
   }
 
   if (options.blockAds === false) {
@@ -233,6 +259,15 @@ async function buildMetaObject(
     );
   }
 
+  if (internalOptions.forceEngine === undefined) {
+    const forcedEngine = getEngineForUrl(url);
+    if (forcedEngine !== undefined) {
+      internalOptions = Object.assign(internalOptions, {
+        forceEngine: forcedEngine,
+      });
+    }
+  }
+
   const logger = _logger.child({
     module: "ScrapeURL",
     scrapeId: id,
@@ -277,6 +312,7 @@ async function buildMetaObject(
         ? await loadMock(options.useMock, _logger)
         : null,
     pdfPrefetch: undefined,
+    documentPrefetch: undefined,
     costTracking,
   };
 }
@@ -306,6 +342,8 @@ export type InternalOptions = {
   v1JSONAgent?: Exclude<ScrapeOptionsV1["jsonOptions"], undefined>["agent"];
   v1JSONSystemPrompt?: string;
   v1OriginalFormat?: "extract" | "json"; // Track original v1 format for backward compatibility
+
+  isPreCrawl?: boolean; // Whether this scrape is part of a precrawl job
 };
 
 type EngineScrapeResultWithContext = {
@@ -560,6 +598,7 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
               error.error instanceof ActionError ||
               error.error instanceof UnsupportedFileError ||
               error.error instanceof PDFAntibotError ||
+              error.error instanceof DocumentAntibotError ||
               error.error instanceof PDFInsufficientTimeError ||
               error.error instanceof ProxySelectionError
             ) {
@@ -696,6 +735,7 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
       rawHtml: engineResult.html,
       screenshot: engineResult.screenshot,
       actions: engineResult.actions,
+      branding: engineResult.branding,
       metadata: {
         sourceURL: meta.internalOptions.unnormalizedSourceURL ?? meta.url,
         url: engineResult.url,
@@ -706,7 +746,7 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
           ? { title: engineResult.pdfMetadata.title }
           : {}),
         contentType: engineResult.contentType,
-        proxyUsed: meta.featureFlags.has("stealthProxy") ? "stealth" : "basic",
+        proxyUsed: engineResult.proxyUsed ?? "basic",
         ...(fallbackList.find(x =>
           ["index", "index;documents"].includes(x.engine),
         )
@@ -794,6 +834,12 @@ export async function scrapeURL(
       });
     }
 
+    if (internalOptions.isPreCrawl === true) {
+      setSpanAttributes(span, {
+        "scrape.is_precrawl": true,
+      });
+    }
+
     if (internalOptions.teamFlags?.checkRobotsOnScrape) {
       await withSpan("scrape.robots_check", async robotsSpan => {
         const urlToCheck = meta.rewrittenUrl || meta.url;
@@ -866,7 +912,8 @@ export async function scrapeURL(
       useIndex &&
       meta.options.storeInCache &&
       !meta.internalOptions.zeroDataRetention &&
-      internalOptions.teamId !== process.env.PRECRAWL_TEAM_ID;
+      internalOptions.teamId !== process.env.PRECRAWL_TEAM_ID &&
+      meta.internalOptions.isPreCrawl !== true; // sitemap crawls override teamId but keep the isPreCrawl flag
     if (shouldRecordFrequency) {
       (async () => {
         try {
@@ -939,6 +986,9 @@ export async function scrapeURL(
             if (error.pdfPrefetch) {
               meta.pdfPrefetch = error.pdfPrefetch;
             }
+            if (error.documentPrefetch) {
+              meta.documentPrefetch = error.documentPrefetch;
+            }
           } else if (
             error instanceof RemoveFeatureError &&
             (meta.internalOptions.forceEngine === undefined ||
@@ -969,6 +1019,23 @@ export async function scrapeURL(
               );
               meta.featureFlags = new Set(
                 [...meta.featureFlags].filter(x => x !== "pdf"),
+              );
+            }
+          } else if (
+            error instanceof DocumentAntibotError &&
+            meta.internalOptions.forceEngine === undefined
+          ) {
+            if (meta.documentPrefetch !== undefined) {
+              meta.logger.error(
+                "Document was prefetched and still blocked by antibot, failing",
+              );
+              throw error;
+            } else {
+              meta.logger.debug(
+                "Document was blocked by anti-bot, prefetching with chrome-cdp",
+              );
+              meta.featureFlags = new Set(
+                [...meta.featureFlags].filter(x => x !== "document"),
               );
             }
           } else {
@@ -1051,6 +1118,12 @@ export async function scrapeURL(
         errorType = "PDFPrefetchFailed";
         meta.logger.warn(
           "scrapeURL: Failed to prefetch PDF that is protected by anti-bot",
+          { error },
+        );
+      } else if (error instanceof DocumentPrefetchFailed) {
+        errorType = "DocumentPrefetchFailed";
+        meta.logger.warn(
+          "scrapeURL: Failed to prefetch document that is protected by anti-bot",
           { error },
         );
       } else if (error instanceof ProxySelectionError) {
